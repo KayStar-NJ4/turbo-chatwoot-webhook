@@ -107,11 +107,9 @@ jobs:
                   - ./backup:/app/backup:rw
                   - /etc/localtime:/etc/localtime:ro
                 restart: unless-stopped
-                depends_on:
-                  redis:
-                    condition: service_healthy
-                  postgres:
-                    condition: service_healthy
+                 depends_on:
+                   - redis
+                   - postgres
                 networks:
                   - webhook-network
                 healthcheck:
@@ -121,22 +119,7 @@ jobs:
                   retries: 3
                   start_period: 40s
             
-              nginx:
-                image: nginx:alpine
-                container_name: webhook-nginx-prod
-                ports:
-                  - "9090:80"
-                  - "9443:443"
-                volumes:
-                  - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
-                  - ./nginx/html:/usr/share/nginx/html:ro
-                  - /etc/localtime:/etc/localtime:ro
-                depends_on:
-                  webhook-app:
-                    condition: service_healthy
-                restart: unless-stopped
-                networks:
-                  - webhook-network
+               # Nginx will be configured manually
             
               redis:
                 image: redis:7-alpine
@@ -203,62 +186,7 @@ jobs:
             DB_SSL=false
             EOF
             
-            # Create nginx config for subpath deployment
-            cat > nginx/nginx.conf << 'EOF'
-            events {
-                worker_connections 1024;
-            }
-            
-            http {
-                include       /etc/nginx/mime.types;
-                default_type  application/octet-stream;
-                
-                upstream webhook_app {
-                    server webhook-app:3000;
-                }
-                
-                server {
-                    listen 80;
-                    server_name _;
-                    
-                    # Health check endpoint
-                    location /webhook/health {
-                        return 200 "healthy\n";
-                        add_header Content-Type text/plain;
-                    }
-                    
-                    # Proxy all /webhook requests to the app
-                    location /webhook/ {
-                        proxy_pass http://webhook_app/;
-                        proxy_set_header Host $host;
-                        proxy_set_header X-Real-IP $remote_addr;
-                        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-                        proxy_set_header X-Forwarded-Proto $scheme;
-                        proxy_set_header X-Forwarded-Prefix /webhook;
-                    }
-                    
-                    # Admin panel at /webhook/admin
-                    location /webhook/admin/ {
-                        proxy_pass http://webhook_app/admin/;
-                        proxy_set_header Host $host;
-                        proxy_set_header X-Real-IP $remote_addr;
-                        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-                        proxy_set_header X-Forwarded-Proto $scheme;
-                        proxy_set_header X-Forwarded-Prefix /webhook;
-                    }
-                    
-                    # API endpoints at /webhook/api
-                    location /webhook/api/ {
-                        proxy_pass http://webhook_app/api/;
-                        proxy_set_header Host $host;
-                        proxy_set_header X-Real-IP $remote_addr;
-                        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-                        proxy_set_header X-Forwarded-Proto $scheme;
-                        proxy_set_header X-Forwarded-Prefix /webhook;
-                    }
-                }
-            }
-            EOF
+             # Nginx config will be set up manually
             
             # Login to GitHub Container Registry
             echo "${{ secrets.GITHUB_TOKEN }}" | docker login ${{ env.DOCKER_REGISTRY }} -u ${{ github.actor }} --password-stdin
@@ -279,9 +207,22 @@ jobs:
             docker volume rm webhook_postgres_data 2>/dev/null || true
             docker volume rm webhook_redis_data 2>/dev/null || true
             
-            # Start new containers
-            echo "Starting containers..."
-            docker compose -f docker-compose.prod.yml up -d
+             # Start PostgreSQL first
+             echo "Starting PostgreSQL..."
+             docker compose -f docker-compose.prod.yml up -d postgres
+             
+             # Wait for PostgreSQL to be ready
+             echo "Waiting for PostgreSQL to be ready..."
+             sleep 30
+             
+             # Create database and run initialization
+             echo "Creating database and running initialization..."
+             docker exec webhook-postgres-prod psql -U postgres -c "CREATE DATABASE chatwoot_webhook;" 2>/dev/null || echo "Database might already exist"
+             docker exec -i webhook-postgres-prod psql -U postgres -d chatwoot_webhook < scripts/init-db.sql
+             
+             # Start all containers
+             echo "Starting all containers..."
+             docker compose -f docker-compose.prod.yml up -d
             
             # Wait a bit for containers to start
             sleep 10
@@ -336,9 +277,9 @@ jobs:
             echo "=== Checking Webhook App ==="
             docker compose -f docker-compose.prod.yml ps webhook-app
             
-            # Check health endpoint
+            # Check health endpoint directly from container
             echo "=== Health Check ==="
-            if curl -f http://localhost:9090/webhook/health; then
+            if docker exec turbo-chatwoot-webhook-prod curl -f http://localhost:3000/webhook/health; then
               echo "✅ Deployment successful - Health check passed"
             else
               echo "❌ Deployment failed - Health check failed"
